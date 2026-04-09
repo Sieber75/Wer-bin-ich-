@@ -24,6 +24,7 @@
   const db  = getDatabase(app);
 
   let myName = "", myId = "", roomId = "", isHost = false, buzzLocked = false;
+  let timerInterval = null;
 
   const $ = id => document.getElementById(id);
   const show = id => { document.querySelectorAll('.screen').forEach(s => s.classList.remove('active')); $(id).classList.add('active'); };
@@ -36,7 +37,12 @@
     myName = name; isHost = true;
     myId = push(ref(db, '_ids')).key;
     roomId = Math.random().toString(36).slice(2,7).toUpperCase();
-    await set(ref(db, `rooms/${roomId}`), { host: myId, status: 'lobby', image: null, buzz: null, answer: null, buzzLocked: false });
+    await set(ref(db, `rooms/${roomId}`), {
+      host: myId, status: 'lobby',
+      image: null, buzz: null, answer: null,
+      buzzLocked: false, timerDuration: 60,
+      timerEnd: null, timerRunning: false
+    });
     enterRoom();
   };
 
@@ -58,7 +64,10 @@
     show('screen-lobby');
     $('room-code-display').textContent = roomId;
     $('lobby-name').textContent = myName;
-    if (isHost) { $('host-controls').style.display = 'flex'; $('btn-start-game').onclick = () => set(ref(db, `rooms/${roomId}/status`), 'playing'); }
+    if (isHost) {
+      $('host-controls').style.display = 'flex';
+      $('btn-start-game').onclick = () => set(ref(db, `rooms/${roomId}/status`), 'playing');
+    }
     onValue(ref(db, `rooms/${roomId}/players`), snap => renderPlayerList(snap.val() || {}));
     onValue(ref(db, `rooms/${roomId}/status`), snap => {
       if (snap.val() === 'playing') enterGame();
@@ -79,11 +88,73 @@
   function enterGame() {
     show('screen-game');
     buzzLocked = false;
-    if (isHost) { $('host-panel').style.display='flex'; $('player-panel').style.display='none'; setupHost(); }
-    else        { $('host-panel').style.display='none'; $('player-panel').style.display='flex'; setupPlayer(); }
+    if (isHost) {
+      $('host-panel').style.display = 'flex';
+      $('player-panel').style.display = 'none';
+      setupHost();
+    } else {
+      $('host-panel').style.display = 'none';
+      $('player-panel').style.display = 'flex';
+      setupPlayer();
+    }
   }
 
+  // ── TIMER LOGIC ──
+  function startLocalTimer(endTime) {
+    clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
+      updateTimerDisplay(remaining);
+      if (remaining <= 0) {
+        clearInterval(timerInterval);
+        if (isHost) {
+          set(ref(db, `rooms/${roomId}/timerRunning`), false);
+        }
+      }
+    }, 200);
+  }
+
+  function updateTimerDisplay(seconds) {
+    const els = document.querySelectorAll('.timer-display');
+    const pct = Math.min(100, (seconds / currentDuration) * 100);
+    els.forEach(el => {
+      el.textContent = seconds + 's';
+      el.className = 'timer-display' + (seconds <= 10 ? ' urgent' : seconds <= 20 ? ' warning' : '');
+    });
+    document.querySelectorAll('.timer-bar-fill').forEach(el => {
+      el.style.width = pct + '%';
+      el.className = 'timer-bar-fill' + (seconds <= 10 ? ' urgent' : seconds <= 20 ? ' warning' : '');
+    });
+  }
+
+  let currentDuration = 60;
+
+  // ── HOST ──
   function setupHost() {
+    // Timer duration selector
+    document.querySelectorAll('.timer-btn').forEach(btn => {
+      btn.onclick = async () => {
+        document.querySelectorAll('.timer-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentDuration = parseInt(btn.dataset.sec);
+        await set(ref(db, `rooms/${roomId}/timerDuration`), currentDuration);
+      };
+    });
+
+    $('btn-start-timer').onclick = async () => {
+      const endTime = Date.now() + currentDuration * 1000;
+      await set(ref(db, `rooms/${roomId}/timerEnd`), endTime);
+      await set(ref(db, `rooms/${roomId}/timerRunning`), true);
+      startLocalTimer(endTime);
+    };
+
+    $('btn-stop-timer').onclick = async () => {
+      clearInterval(timerInterval);
+      await set(ref(db, `rooms/${roomId}/timerRunning`), false);
+      await set(ref(db, `rooms/${roomId}/timerEnd`), null);
+      updateTimerDisplay(currentDuration);
+    };
+
     $('file-input').onchange = async e => {
       const file = e.target.files[0]; if (!file) return;
       $('upload-status').textContent = 'Wird hochgeladen…';
@@ -97,12 +168,17 @@
       };
       reader.readAsDataURL(file);
     };
+
     $('btn-clear-buzz').onclick = clearRound;
     $('btn-next-round').onclick = async () => {
       await set(ref(db, `rooms/${roomId}/image`), null);
       await clearRound();
-      $('host-img-preview').style.display='none';
-      $('upload-status').textContent='';
+      clearInterval(timerInterval);
+      await set(ref(db, `rooms/${roomId}/timerRunning`), false);
+      await set(ref(db, `rooms/${roomId}/timerEnd`), null);
+      updateTimerDisplay(currentDuration);
+      $('host-img-preview').style.display = 'none';
+      $('upload-status').textContent = '';
     };
     $('btn-give-point').onclick = async () => {
       const buzzSnap = await get(ref(db, `rooms/${roomId}/buzz`));
@@ -112,6 +188,14 @@
       await set(scoreRef, (s.val()||0)+1);
     };
     $('btn-end-game').onclick = () => set(ref(db, `rooms/${roomId}/status`), 'ended');
+
+    onValue(ref(db, `rooms/${roomId}/timerDuration`), snap => {
+      if (snap.val()) currentDuration = snap.val();
+    });
+    onValue(ref(db, `rooms/${roomId}/timerEnd`), snap => {
+      const endTime = snap.val();
+      if (endTime && Date.now() < endTime) startLocalTimer(endTime);
+    });
     onValue(ref(db, `rooms/${roomId}/buzz`), snap => {
       const buzz = snap.val();
       $('buzz-result-host').innerHTML = buzz
@@ -124,7 +208,10 @@
       box.style.display = a ? 'block' : 'none';
       if (a) $('answer-text-host').textContent = `💬 „${a.text}"`;
     });
-    onValue(ref(db, `rooms/${roomId}/players`), snap => { renderPlayerList(snap.val()||{}); renderScoreboard(snap.val()||{}); });
+    onValue(ref(db, `rooms/${roomId}/players`), snap => {
+      renderPlayerList(snap.val()||{});
+      renderScoreboard(snap.val()||{});
+    });
   }
 
   async function clearRound() {
@@ -134,8 +221,18 @@
     $('answer-box-host').style.display = 'none';
   }
 
+  // ── PLAYER ──
   function setupPlayer() {
     $('my-player-name').textContent = myName;
+
+    onValue(ref(db, `rooms/${roomId}/timerDuration`), snap => {
+      if (snap.val()) currentDuration = snap.val();
+    });
+    onValue(ref(db, `rooms/${roomId}/timerEnd`), snap => {
+      const endTime = snap.val();
+      if (endTime && Date.now() < endTime) startLocalTimer(endTime);
+      else if (!endTime) { clearInterval(timerInterval); updateTimerDisplay(currentDuration); }
+    });
     onValue(ref(db, `rooms/${roomId}/image`), snap => {
       const img = snap.val();
       if (img) { $('game-image').src=img; $('game-image').style.display='block'; $('no-image-msg').style.display='none'; }
@@ -167,6 +264,7 @@
       if (a) el.innerHTML = `<div class="answer-bubble"><strong>${a.playerName}:</strong> „${a.text}"</div>`;
     });
     onValue(ref(db, `rooms/${roomId}/players`), snap => renderScoreboard(snap.val()||{}));
+
     $('big-buzzer').onclick = pressBuzzer;
     $('btn-send-answer').onclick = async () => {
       const text = $('answer-input').value.trim();
@@ -198,6 +296,7 @@
   }
 
   function showEndScreen() {
+    clearInterval(timerInterval);
     show('screen-end');
     get(ref(db,`rooms/${roomId}/players`)).then(snap=>{
       const players = snap.val()||{};
@@ -208,22 +307,31 @@
 
   function shake(id) { const el=$(id); el.classList.remove('shake'); void el.offsetWidth; el.classList.add('shake'); }
 </script>
+
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;900&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-:root{--bg:#EEF4FF;--card:#fff;--blue:#1A6FFF;--blue-dark:#0052CC;--blue-light:#E8F0FF;--blue-mid:#C2D8FF;--text:#0A1628;--muted:#6B80A0;--red:#FF3B5C;--green:#00B87A;--shadow:0 2px 16px rgba(26,111,255,0.10);--radius:16px;}
+:root{
+  --bg:#EEF4FF;--card:#fff;--blue:#1A6FFF;--blue-dark:#0052CC;
+  --blue-light:#E8F0FF;--blue-mid:#C2D8FF;
+  --text:#0A1628;--muted:#6B80A0;--red:#FF3B5C;--green:#00B87A;
+  --orange:#FF8C00;--shadow:0 2px 16px rgba(26,111,255,0.10);--radius:16px;
+}
 html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito',sans-serif;overflow:hidden;}
 .screen{display:none;flex-direction:column;align-items:center;height:100vh;width:100%;position:absolute;inset:0;overflow-y:auto;padding:1.5rem 1rem 2rem;}
 .screen.active{display:flex;}
+
 #screen-home{justify-content:center;gap:2rem;background:linear-gradient(160deg,#1A6FFF 0%,#003A99 100%);}
 .home-logo{font-weight:900;font-size:clamp(2.5rem,9vw,4.5rem);text-align:center;line-height:1.1;color:#fff;}
 .home-logo em{color:#FFE566;font-style:normal;}
 .home-sub{font-size:.8rem;letter-spacing:3px;text-transform:uppercase;color:rgba(255,255,255,0.6);text-align:center;}
 .home-btns{display:flex;flex-direction:column;gap:.8rem;width:100%;max-width:320px;}
+
 .btn-primary{padding:1rem;border:none;background:var(--blue);color:#fff;font-family:'Nunito',sans-serif;font-weight:700;font-size:1rem;border-radius:14px;cursor:pointer;box-shadow:var(--shadow);transition:transform .15s;}
 .btn-primary:active{transform:scale(.97);}
 #screen-home .btn-primary{background:#FFE566;color:#003A99;}
 #screen-end .btn-primary{background:#FFE566;color:#003A99;max-width:300px;width:100%;}
+
 #screen-setup,#screen-lobby{gap:1.2rem;max-width:420px;margin:0 auto;background:var(--bg);}
 .setup-title{font-weight:900;font-size:1.8rem;margin-top:1rem;color:var(--blue-dark);}
 .setup-section{width:100%;background:var(--card);border-radius:var(--radius);padding:1.3rem;display:flex;flex-direction:column;gap:.8rem;box-shadow:var(--shadow);}
@@ -234,6 +342,7 @@ input[type=text].shake{animation:shake .4s;}
 @keyframes shake{0%,100%{transform:translateX(0);}25%{transform:translateX(-6px);}75%{transform:translateX(6px)};}
 .error-msg{font-size:.75rem;color:var(--red);font-weight:600;}
 .divider{text-align:center;color:var(--muted);font-size:.85rem;font-weight:600;}
+
 .lobby-header{text-align:center;margin-top:.5rem;}
 .lobby-header h2{font-weight:900;font-size:1.6rem;color:var(--blue-dark);}
 .room-code-box{background:linear-gradient(135deg,var(--blue),var(--blue-dark));color:#fff;border-radius:14px;padding:.7rem 1.6rem;font-weight:900;font-size:2rem;letter-spacing:6px;text-align:center;box-shadow:0 4px 20px rgba(26,111,255,0.3);}
@@ -244,51 +353,83 @@ input[type=text].shake{animation:shake .4s;}
 .chip-dot{width:8px;height:8px;border-radius:50%;background:var(--blue);flex-shrink:0;}
 .chip-score{margin-left:auto;font-size:.7rem;color:var(--muted);}
 #host-controls{display:none;flex-direction:column;gap:.6rem;width:100%;}
-#screen-game{gap:1rem;max-width:500px;margin:0 auto;background:var(--bg);}
-#host-panel,#player-panel{display:none;flex-direction:column;width:100%;gap:1rem;}
-.upload-area{background:#fff;border:2px dashed var(--blue-mid);border-radius:var(--radius);padding:1.5rem;text-align:center;cursor:pointer;}
+
+#screen-game{gap:.8rem;max-width:500px;margin:0 auto;background:var(--bg);}
+#host-panel,#player-panel{display:none;flex-direction:column;width:100%;gap:.8rem;}
+
+/* TIMER */
+.timer-section{background:#fff;border-radius:var(--radius);padding:1rem;box-shadow:var(--shadow);}
+.timer-label{font-size:.7rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:.6rem;}
+.timer-btns{display:flex;gap:.4rem;margin-bottom:.7rem;}
+.timer-btn{flex:1;padding:.5rem;border:2px solid var(--blue-mid);background:#fff;color:var(--muted);font-family:'Nunito',sans-serif;font-weight:700;font-size:.85rem;border-radius:8px;cursor:pointer;transition:all .15s;}
+.timer-btn.active{background:var(--blue);color:#fff;border-color:var(--blue);}
+.timer-controls{display:flex;gap:.5rem;}
+.btn-timer-go{flex:1;padding:.6rem;border:none;background:var(--green);color:#fff;font-family:'Nunito',sans-serif;font-weight:700;font-size:.85rem;border-radius:8px;cursor:pointer;}
+.btn-timer-stop{flex:1;padding:.6rem;border:none;background:#FFE0E0;color:var(--red);font-family:'Nunito',sans-serif;font-weight:700;font-size:.85rem;border-radius:8px;cursor:pointer;}
+
+/* TIMER DISPLAY (shown to all) */
+.timer-display-wrap{background:#fff;border-radius:14px;padding:.8rem 1rem;box-shadow:var(--shadow);text-align:center;}
+.timer-display{font-weight:900;font-size:2.5rem;color:var(--blue);transition:color .3s;}
+.timer-display.warning{color:var(--orange);}
+.timer-display.urgent{color:var(--red);animation:pulse 0.5s infinite alternate;}
+@keyframes pulse{0%{transform:scale(1);}100%{transform:scale(1.08);}}
+.timer-bar{height:8px;background:var(--blue-light);border-radius:99px;overflow:hidden;margin-top:.4rem;}
+.timer-bar-fill{height:100%;background:var(--blue);border-radius:99px;transition:width .3s linear,background .3s;}
+.timer-bar-fill.warning{background:var(--orange);}
+.timer-bar-fill.urgent{background:var(--red);}
+
+.upload-area{background:#fff;border:2px dashed var(--blue-mid);border-radius:var(--radius);padding:1.2rem;text-align:center;cursor:pointer;}
 .upload-area:active{background:var(--blue-light);}
-.upload-icon{font-size:2rem;margin-bottom:.4rem;}
+.upload-icon{font-size:1.8rem;margin-bottom:.3rem;}
 .upload-area p{font-size:.85rem;color:var(--muted);font-weight:600;}
 input[type=file]{display:none;}
-#upload-status{font-size:.8rem;color:var(--blue);text-align:center;min-height:1.2rem;font-weight:700;}
-#host-img-preview{display:none;width:100%;max-height:200px;object-fit:contain;border-radius:12px;border:2px solid var(--blue-mid);}
-.buzz-result-box{background:#fff;border-radius:14px;padding:1rem;text-align:center;min-height:56px;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow);}
+#upload-status{font-size:.8rem;color:var(--blue);text-align:center;min-height:1rem;font-weight:700;}
+#host-img-preview{display:none;width:100%;max-height:180px;object-fit:contain;border-radius:12px;border:2px solid var(--blue-mid);}
+
+.buzz-result-box{background:#fff;border-radius:14px;padding:1rem;text-align:center;min-height:52px;display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow);}
 .waiting-buzz{color:var(--muted);font-size:.85rem;font-weight:600;}
 .buzz-name{font-size:1.1rem;font-weight:700;color:var(--blue-dark);}
 .answer-box-host{display:none;background:var(--blue-light);border:2px solid var(--blue-mid);border-radius:14px;padding:1rem;text-align:center;font-weight:700;color:var(--blue-dark);font-size:1rem;}
-.host-actions{display:flex;gap:.6rem;flex-wrap:wrap;}
-.btn-sm{flex:1;min-width:130px;padding:.7rem;border:2px solid var(--blue-mid);background:#fff;color:var(--blue-dark);font-family:'Nunito',sans-serif;font-weight:700;font-size:.82rem;border-radius:10px;cursor:pointer;}
+
+.host-actions{display:flex;gap:.5rem;flex-wrap:wrap;}
+.btn-sm{flex:1;min-width:120px;padding:.65rem;border:2px solid var(--blue-mid);background:#fff;color:var(--blue-dark);font-family:'Nunito',sans-serif;font-weight:700;font-size:.8rem;border-radius:10px;cursor:pointer;}
 .btn-sm:active{background:var(--blue-light);}
 .btn-sm.danger{border-color:#FFD0D8;color:var(--red);}
 .btn-sm.success{border-color:#B3EFDA;color:var(--green);}
+
 .scoreboard-wrap{width:100%;}
 .scoreboard-title{font-size:.65rem;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem;font-weight:700;}
-.scoreboard{display:flex;flex-direction:column;gap:.35rem;}
-.score-row{display:flex;align-items:center;gap:.7rem;background:#fff;border-radius:10px;padding:.5rem .9rem;box-shadow:var(--shadow);}
+.scoreboard{display:flex;flex-direction:column;gap:.3rem;}
+.score-row{display:flex;align-items:center;gap:.7rem;background:#fff;border-radius:10px;padding:.45rem .9rem;box-shadow:var(--shadow);}
 .score-row.me{background:var(--blue-light);border:2px solid var(--blue-mid);}
 .rank{font-size:.75rem;color:var(--muted);width:16px;font-weight:700;}
 .sname{flex:1;font-size:.9rem;font-weight:600;}
 .spts{font-weight:700;font-size:.9rem;color:var(--blue);}
-#game-image{width:100%;max-height:220px;object-fit:contain;border-radius:14px;border:2px solid var(--blue-mid);}
-#no-image-msg{display:flex;flex-direction:column;align-items:center;justify-content:center;background:#fff;border-radius:14px;height:150px;gap:.5rem;color:var(--muted);box-shadow:var(--shadow);}
+
+#game-image{width:100%;max-height:200px;object-fit:contain;border-radius:14px;border:2px solid var(--blue-mid);}
+#no-image-msg{display:flex;flex-direction:column;align-items:center;justify-content:center;background:#fff;border-radius:14px;height:130px;gap:.5rem;color:var(--muted);box-shadow:var(--shadow);}
 #no-image-msg .ni-icon{font-size:2rem;}
 #no-image-msg p{font-size:.8rem;font-weight:600;}
-.buzzer-wrap{display:flex;justify-content:center;padding:.8rem 0;}
-#big-buzzer{width:150px;height:150px;border-radius:50%;background:linear-gradient(145deg,#1A6FFF,#0052CC);border:none;font-size:3.2rem;cursor:pointer;box-shadow:0 0 0 10px rgba(26,111,255,0.15),0 10px 35px rgba(26,111,255,0.45);transition:transform .1s;display:flex;align-items:center;justify-content:center;}
+
+.buzzer-wrap{display:flex;justify-content:center;padding:.5rem 0;}
+#big-buzzer{width:140px;height:140px;border-radius:50%;background:linear-gradient(145deg,#1A6FFF,#0052CC);border:none;font-size:3rem;cursor:pointer;box-shadow:0 0 0 10px rgba(26,111,255,0.15),0 10px 35px rgba(26,111,255,0.45);transition:transform .1s;display:flex;align-items:center;justify-content:center;}
 #big-buzzer:active{transform:scale(.92);}
 #big-buzzer.locked{background:linear-gradient(145deg,#ccc,#aaa);box-shadow:none;cursor:default;opacity:.5;}
-#buzz-result-player{text-align:center;min-height:2rem;font-size:1rem;font-weight:700;}
+
+#buzz-result-player{text-align:center;min-height:1.8rem;font-size:1rem;font-weight:700;}
 .buzz-me{color:var(--blue);font-weight:800;}
 .buzz-other{color:var(--muted);}
 .my-name-tag{text-align:center;font-size:.75rem;color:var(--muted);letter-spacing:1px;font-weight:600;}
+
 #answer-section{display:none;flex-direction:column;gap:.6rem;background:#fff;border-radius:14px;padding:1rem;box-shadow:var(--shadow);}
 #answer-section p{font-size:.85rem;font-weight:700;color:var(--blue-dark);text-align:center;}
 #answer-input{width:100%;padding:.8rem 1rem;background:var(--blue-light);border:2px solid var(--blue-mid);border-radius:10px;color:var(--text);font-family:'Nunito',sans-serif;font-size:1rem;outline:none;}
 #answer-input:focus{border-color:var(--blue);}
 #btn-send-answer{padding:.8rem;border:none;background:linear-gradient(135deg,var(--blue),var(--blue-dark));color:#fff;font-family:'Nunito',sans-serif;font-weight:700;font-size:1rem;border-radius:10px;cursor:pointer;}
+
 #answer-display{display:none;}
 .answer-bubble{background:var(--blue-light);border:2px solid var(--blue-mid);border-radius:14px;padding:.9rem 1.1rem;font-weight:700;color:var(--blue-dark);font-size:.95rem;text-align:center;}
+
 #screen-end{justify-content:center;gap:1.5rem;background:linear-gradient(160deg,#1A6FFF,#003A99);}
 .end-title{font-weight:900;font-size:2rem;text-align:center;color:#fff;}
 #podium{width:100%;max-width:360px;display:flex;flex-direction:column;gap:.5rem;}
@@ -300,11 +441,13 @@ input[type=file]{display:none;}
 </style>
 </head>
 <body>
+
 <div id="screen-home" class="screen active">
   <div class="home-logo">Wer<br>bin <em>ich?</em></div>
   <div class="home-sub">Multiplayer Buzzer</div>
   <div class="home-btns"><button class="btn-primary" onclick="goSetup()">▶ Spiel starten</button></div>
 </div>
+
 <div id="screen-setup" class="screen">
   <div class="setup-title">Mitspielen</div>
   <div class="setup-section">
@@ -321,6 +464,7 @@ input[type=file]{display:none;}
     <button class="btn-primary" onclick="joinRoom()">Beitreten</button>
   </div>
 </div>
+
 <div id="screen-lobby" class="screen">
   <div class="lobby-header"><h2>Warteraum</h2><p style="font-size:.85rem;color:var(--muted);margin-top:.3rem;font-weight:600;">Hallo, <span id="lobby-name"></span>!</p></div>
   <div style="width:100%;max-width:400px;display:flex;flex-direction:column;gap:1rem;">
@@ -330,42 +474,84 @@ input[type=file]{display:none;}
     <p style="font-size:.75rem;color:var(--muted);text-align:center;font-weight:600;">Nur der Host kann das Spiel starten.</p>
   </div>
 </div>
+
 <div id="screen-game" class="screen">
+
+  <!-- HOST -->
   <div id="host-panel">
-    <p style="font-weight:900;font-size:1.2rem;color:var(--blue-dark);">🎮 Host-Ansicht</p>
+    <p style="font-weight:900;font-size:1.1rem;color:var(--blue-dark);">🎮 Host-Ansicht</p>
+
+    <!-- Timer -->
+    <div class="timer-section">
+      <div class="timer-label">⏱ Zeit pro Runde</div>
+      <div class="timer-btns">
+        <button class="timer-btn" data-sec="15">15s</button>
+        <button class="timer-btn" data-sec="30">30s</button>
+        <button class="timer-btn active" data-sec="60">60s</button>
+        <button class="timer-btn" data-sec="90">90s</button>
+        <button class="timer-btn" data-sec="120">2min</button>
+      </div>
+      <div class="timer-controls">
+        <button class="btn-timer-go" id="btn-start-timer">▶ Timer starten</button>
+        <button class="btn-timer-stop" id="btn-stop-timer">⏹ Stopp</button>
+      </div>
+    </div>
+
+    <div class="timer-display-wrap">
+      <div class="timer-display">60s</div>
+      <div class="timer-bar"><div class="timer-bar-fill" style="width:100%"></div></div>
+    </div>
+
     <div class="upload-area" onclick="document.getElementById('file-input').click()"><div class="upload-icon">📷</div><p>Bild hochladen<br><span style="font-size:.75rem">Tap zum Auswählen</span></p></div>
     <input type="file" id="file-input" accept="image/*">
     <div id="upload-status"></div>
     <img id="host-img-preview" alt="Vorschau">
+
     <div class="buzz-result-box"><div id="buzz-result-host"><span class="waiting-buzz">Warte auf Buzzer…</span></div></div>
     <div class="answer-box-host" id="answer-box-host"><div id="answer-text-host"></div></div>
+
     <div class="host-actions">
       <button class="btn-sm success" id="btn-give-point">✓ Punkt geben</button>
       <button class="btn-sm" id="btn-clear-buzz">🔄 Buzzer freigeben</button>
       <button class="btn-sm" id="btn-next-round">⏭ Nächste Runde</button>
       <button class="btn-sm danger" id="btn-end-game">⏹ Beenden</button>
     </div>
+
     <div class="scoreboard-wrap"><div class="scoreboard-title">Punktestand</div><div class="scoreboard"></div></div>
   </div>
+
+  <!-- PLAYER -->
   <div id="player-panel">
     <p class="my-name-tag">Spieler: <strong id="my-player-name"></strong></p>
+
+    <div class="timer-display-wrap">
+      <div class="timer-display">–</div>
+      <div class="timer-bar"><div class="timer-bar-fill" style="width:100%"></div></div>
+    </div>
+
     <img id="game-image" alt="Bild" style="display:none">
     <div id="no-image-msg"><div class="ni-icon">🖼️</div><p>Host lädt Bild hoch…</p></div>
+
     <div class="buzzer-wrap"><button id="big-buzzer">🔔</button></div>
     <div id="buzz-result-player"></div>
+
     <div id="answer-section">
       <p>✍️ Gib deine Antwort ein:</p>
       <input type="text" id="answer-input" placeholder="Deine Antwort…" maxlength="100">
       <button id="btn-send-answer">Antwort absenden</button>
     </div>
     <div id="answer-display"></div>
+
     <div class="scoreboard-wrap"><div class="scoreboard-title">Punktestand</div><div class="scoreboard"></div></div>
   </div>
+
 </div>
+
 <div id="screen-end" class="screen">
   <div class="end-title">🏆 Ergebnis</div>
   <div id="podium"></div>
   <button class="btn-primary" style="margin-top:1rem" onclick="location.reload()">Neues Spiel</button>
 </div>
+
 </body>
 </html>
